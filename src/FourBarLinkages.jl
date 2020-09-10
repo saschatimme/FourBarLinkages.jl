@@ -2,6 +2,8 @@ module FourBarLinkages
 
 # export compute_generic_solutions, save_generic_solutions, load_generic_solutions,
 #     solve_instance, four_bars, FourBar, animate, configurations
+export start_demo
+
 
 import HomotopyContinuation
 const HC = HomotopyContinuation
@@ -12,6 +14,9 @@ using LinearAlgebra
 # using Makie
 using Parameters: @unpack
 using AbstractPlotting, GLMakie
+using AbstractPlotting.MakieLayout
+using ColorSchemes, Printf
+
 # import JLD2, FileIO
 #
 # include("sp_homotopy.jl")
@@ -70,7 +75,7 @@ function FourBar(F::FourBar, angles)
     )
 end
 
-function four_bar_from_lengths(;A::ComplexF64, B::ComplexF64, BC, CD, AD)
+function four_bar_from_lengths(; A::ComplexF64, B::ComplexF64, BC, CD, AD)
     HC.@var a[1:2] b[1:2] c[1:2] d[1:2] l[1:5]
     F = HC.System(
         [
@@ -84,7 +89,8 @@ function four_bar_from_lengths(;A::ComplexF64, B::ComplexF64, BC, CD, AD)
     )
 
     for i = 1:5
-        res = HC.solve(F, target_parameters = [randn(5); real(A); imag(A); real(B); imag(B)])
+        res =
+            HC.solve(F, target_parameters = [randn(5); real(A); imag(A); real(B); imag(B)])
         S = HC.real_solutions(res)
         if !isempty(S)
             s = S[1]
@@ -119,7 +125,7 @@ end
 
 
 is_conjugated_pair(u, v, tol) = abs(u - conj(v)) < tol
-is_valid_loop_solution(μ, θ, τ, τ̂; tol::Float64 = 1e-8) =
+is_valid_loop_solution(μ, θ, τ, τ̂; tol::Float64 = 1e-12) =
     is_conjugated_pair(τ, τ̂, tol) && abs(abs(μ) - 1) < tol && abs(abs(θ) - 1) < tol
 
 function loop_homotopy()
@@ -181,25 +187,28 @@ function trace_curve(F::FourBar; Δt = 1e-2, max_steps = 1_000, accuracy = 1e-8)
     y = copy(x)
     Δ = Δt
     for i = 2:max_steps
-        @show i Δ
-        retcode = HC.track!(tracker, y, cis(φ), cis(φ + Δ))
+        if φ * (φ + Δ) < 0 # jump over zero
+            φ′ = 0.0
+        else
+            φ′ = φ + Δ
+        end
+        retcode = HC.track!(tracker, y, cis(φ), cis(φ′))
         if retcode != HC.TrackerCode.success
             @warn "PathTracker failed with $retcode"
             break
         end
         μ, θ, τ, τ̂ = x
         if is_valid_loop_solution(μ, θ, τ, τ̂)
-            # @show abs(angles[end].μ - μ)
-            # if abs(angle(angles[end].μ) - angle(μ)) < 2Δt
-            φ += Δ
-            Δ = clamp(2Δ, -Δt, Δt)
-            push!(angles, (λ = cis(φ), μ = μ, θ = θ))
-            y .= x
-            # reduce step size since μ jump is too large
-            # else
-            #     println("reduce")
-            #     Δ /= 2
-            # end
+            if abs(angle(angles[end].μ) - angle(μ)) < 2Δt
+                φ = φ′
+                Δ = clamp(2Δ, -Δt, Δt)
+                push!(angles, (λ = cis(φ), μ = μ, θ = θ))
+                y .= x
+                # reduce step size since μ jump is too large
+            else
+                Δ /= 2
+                continue
+            end
         else
             # jump to different branch
             branch_solutions = map(generic_solutions) do s
@@ -216,6 +225,7 @@ function trace_curve(F::FourBar; Δt = 1e-2, max_steps = 1_000, accuracy = 1e-8)
             φ += 2π
         end
         if abs(φ - φ₀) < 0.5Δt && abs(1 - y[1]) < 1e-3 && abs(1 - y[2]) < 1e-3
+            pop!(angles)
             break
         end
     end
@@ -226,6 +236,282 @@ end
 
 fourbar_to_points(F) = Point.(reim.((F.A, F.B, F.C, F.D)))
 
+
+function energy(
+    fourbar;
+    resting_lengths::Vector{Float64},
+    elasticities::Vector{Float64},
+    E::ComplexF64,
+    F::ComplexF64,
+)
+    c1, c2 = elasticities
+    r1, r2 = resting_lengths
+    c1 * (sqrt(abs2(fourbar.C - E)) - r1)^2 + c2 * (sqrt(abs2(fourbar.D - F)) - r2)^2
+end
+
+function energy_system(;
+    bar_lengths::Vector,
+    resting_lengths,
+    elasticities,
+    A::ComplexF64,
+    B::ComplexF64,
+)
+    HC.@var p[1:2, 1:6]
+
+    bars = [(2, 3), (3, 4), (4, 1)]
+    cables = [(3, 5), (2, 6)]
+
+    HC.@var l²[1:3] δ[1:2] λ[1:5]
+
+    G = [
+        [sum((p[:, i] - p[:, j]) .^ 2) .- l²[k] for (k, (i, j)) in enumerate(bars)]
+        [sum((p[:, i] - p[:, j]) .^ 2) .- δ[k]^2 for (k, (i, j)) in enumerate(cables)]
+    ]
+    Q = sum((δ .- resting_lengths) .^ 2)
+    L = Q + λ'G
+
+    X = [p[:, 3]; p[:, 4]]
+    # fix constants
+    L′ = HC.subs(
+        L,
+        p[:, 1] => [real(A), imag(A)],
+        p[:, 2] => [real(B), imag(B)],
+        l² => bar_lengths .^ 2,
+    )
+    Y = [p[:, 5]; p[:, 6]]
+    ∇L = HC.differentiate(L′, [X; δ; λ])
+    F = HC.System(∇L, variables = [X; δ; λ], parameters = Y)
+end
+
+function local_minimum_checker(;
+    bar_lengths::Vector,
+    resting_lengths,
+    elasticities,
+    A::ComplexF64,
+    B::ComplexF64,
+)
+    HC.@var p[1:2, 1:6]
+
+
+    bars = [(2, 3), (3, 4), (4, 1)]
+    cables = [(3, 5), (2, 6)]
+
+    HC.@var l²[1:3] r[1:2] δ[1:2] λ[1:5]
+
+    G = HC.subs(
+        [
+            [sum((p[:, i] - p[:, j]) .^ 2) .- l²[k] for (k, (i, j)) in enumerate(bars)]
+            [sum((p[:, i] - p[:, j]) .^ 2) .- δ[k]^2 for (k, (i, j)) in enumerate(cables)]
+        ],
+        p[:, 1] => [real(A), imag(A)],
+        p[:, 2] => [real(B), imag(B)],
+        l² => bar_lengths .^ 2,
+    )
+
+    Q = sum((δ .- resting_lengths) .^ 2)
+    L = Q + λ'G
+
+    X = [p[:, 3]; p[:, 4]]
+    # fix constants
+    L′ = HC.subs(
+        L,
+        p[:, 1] => [real(A), imag(A)],
+        p[:, 2] => [real(B), imag(B)],
+        l² => bar_lengths .^ 2,
+    )
+    Y = [p[:, 5]; p[:, 6]]
+    ∇L = HC.differentiate(L′, [X; δ])
+    HL = HC.CompiledSystem(HC.System(∇L, [X; δ], [λ; Y]))
+    dG = HC.CompiledSystem(HC.System(G, [X; δ], [λ; Y]))
+
+    (s, params) -> begin
+        v = s[1:6]
+        q = [s[7:end]; params]
+        W = HC.jacobian!(zeros(6, 6), HL, v, q)
+        V = nullspace(HC.jacobian!(zeros(5, 6), dG, v, q))
+        all(e -> e ≥ 1e-14, eigvals(V' * W * V))
+    end
+end
+
+
+
+
+function comp_min_energy_positions(;
+    A::ComplexF64,
+    B::ComplexF64,
+    E::ComplexF64,
+    F::ComplexF64,
+    bar_lengths,
+    elasticities,
+    resting_lengths,
+)
+
+    energy_sys = energy_system(
+        A = A,
+        B = B,
+        bar_lengths = bar_lengths,
+        elasticities = elasticities,
+        resting_lengths = resting_lengths,
+    )
+    gen_params = randn(ComplexF64, 4)
+    gen_res = HC.solve(energy_sys; target_parameters = gen_params)
+
+
+    min_checker = local_minimum_checker(
+        A = A,
+        B = B,
+        bar_lengths = bar_lengths,
+        elasticities = elasticities,
+        resting_lengths = resting_lengths,
+    )
+    res = HC.solve(
+        energy_sys,
+        gen_res;
+        start_parameters = gen_params,
+        target_parameters = [reim(F)..., reim(E)...],
+    )
+    min_energy_sols = filter(
+        s -> s[5] > 0 && s[6] > 0 && min_checker(s, [reim(F)..., reim(E)...]),
+        HC.real_solutions(res),
+    )
+    min_energy_positions = map(min_energy_sols) do s
+        FourBar(; A = A, B = B, C = complex(s[1], s[2]), D = complex(s[3], s[4]))
+    end
+end
+
+# coordinate transformation between two rects
+function transferrects(pos, rectfrom, rectto)
+    fracpos = (pos .- rectfrom.origin) ./ rectfrom.widths
+    fracpos .* rectto.widths .+ rectto.origin
+end
+
+function add_control_node!(ax, n; kwargs...)
+    selected = Ref(false)
+    plt = scatter!(ax, n; kwargs...)
+    lift(events(ax.scene).mouseposition) do pos
+        x, y = transferrects(pos, ax.scene.px_area[], ax.limits[])
+        if AbstractPlotting.is_mouseinside(ax.scene) && selected[]
+            p = Point2f0(x, y)
+            n[] = p
+        end
+        nothing
+    end
+    on(events(ax.scene).mousedrag) do drag
+        if ispressed(ax.scene, Mouse.left)
+            if drag == Mouse.down
+                plot, _idx = mouse_selection(ax.scene)
+                if plot == plt
+                    selected[] = true
+                end
+            end
+        elseif drag == Mouse.up || !AbstractPlotting.is_mouseinside(ax.scene)
+            selected[] = false
+        end
+    end
+    n
+end
+
+
+
+function start_demo(;
+A = -1.0 + 0im,
+    B = 1.0 + 0im,
+    E = 5.0 + 0im,
+    F = -4.0 - 4im,
+    bar_lengths = [3.0, 2.0, 1.5],
+    elasticities = [1.0, 4.0],
+    resting_lengths = [0.1, 0.1])
+
+    scene, layout = layoutscene(30, resolution = ((1200, 1200)))
+    ax = (layout[1:3, 1] = LAxis(scene, title = "Control plane"))
+    energy_ax = (layout[4, 1] = LAxis(scene, title = "Energy"))
+    energy_ax.ytickformat = xs -> [@sprintf("%05.1f", x) for x in xs]
+
+    min_energy_positions = comp_min_energy_positions(;
+        A = A,
+        B = B,
+        E = E,
+        F = F,
+        bar_lengths = bar_lengths,
+        elasticities = elasticities,
+        resting_lengths = resting_lengths,
+    )
+
+    fourbar = min_energy_positions[1]
+    angles = trace_curve(fourbar; Δt = 1e-1, max_steps = 10_000)
+    loop = FourBar.(Ref(fourbar), angles)
+
+
+    loop_index = Node(1)
+    NABCD = lift(k -> fourbar_to_points(loop[k]), loop_index)
+    NF = Node(Point(reim(F)))
+
+    N_energy = lift(NF) do f
+        energy.(
+            loop;
+            E = E,
+            F = complex(f[1], f[2]),
+            elasticities = elasticities,
+            resting_lengths = resting_lengths,
+        )
+    end
+
+    on(N_energy) do energy
+        n = length(energy)
+        k = loop_index[]
+        # let's go to the right
+        # println(mod1(k - 1, n), " ", k, " ", mod1(k + 1, n))
+        # println(energy[mod1(k - 1, n)], " ", energy[k], " ", energy[mod1(k + 1, n)])
+        while energy[mod1(k + 1, n)] < energy[k] * (1 + 1e-8)
+            k = mod1(k + 1, n)
+        end
+        # @show energy[mod1(k + 1, n)] < energy[k]
+        # if we didn't do a step, go to the left
+        if k == loop_index[]
+            while energy[mod1(k - 1, n)] < energy[k] * (1 + 1e-8)
+                k = mod1(k - 1, n)
+            end
+        end
+        loop_index[] = k
+    end
+    # scene = Scene(limits = limits, resolution = (1200, 1200), scale_plot = false)
+    linesegments!(ax, lift(NABCD) do (A, B, C, D)
+        [B => C, C => D, D => A]
+    end, linewidth = 2, color = :black)
+    linesegments!(ax, lift(NABCD, NF) do (A, B, C, D), F
+        [D => F]
+    end, color = :teal)
+    linesegments!(ax, lift(NABCD) do (A, B, C, D)
+        [C => Point(reim(E))]
+    end, color = :teal)
+
+    add_control_node!(ax, NF; markersize = 20px, marker = :cross, color = :black)
+    scatter!(ax, lift(collect, NABCD), color = :black)
+    scatter!(ax, Point(reim(E)), marker = :rect, color = :black)
+
+
+    # scatter!(ax, Point(reim(F)), marker=:cross)
+    lines!(
+        ax,
+        map(fb -> Point(reim(fb.P₀)), loop),
+        linestyle = :dash,
+    )
+
+
+    NABCD[] = fourbar_to_points(first(loop))
+
+    xlims!(ax, [-10, 10]) # as vector
+    ylims!(ax, [-10, 10]) # as vector
+    ax.aspect = AxisAspect(1)
+
+    scatter!(energy_ax, 1:length(N_energy[]), N_energy)
+    scatter!(energy_ax, lift((i, E) -> Point(i, E[i]), loop_index, N_energy), color = :red)
+    autolimits!(energy_ax)
+    on(N_energy) do _
+        autolimits!(energy_ax)
+    end
+    display(scene)
+end
 
 # function δ_angles_pairs(F::FourBar, δ)
 #     loop, (_, _, _, τ, τ̂) = loop_equations(F)
